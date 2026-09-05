@@ -1,0 +1,1591 @@
+#!/usr/bin/env python3
+"""OmaRemote helper: SSH host aliases and non-blocking remote shares."""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Iterator
+from urllib.parse import quote
+
+
+WILDCARD_CHARS = "*?!["
+DISPLAY_KEYS = {"hostname", "user", "port", "proxyjump", "identityfile"}
+ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+BEGIN_MARK = "# BEGIN omaremote:{alias}"
+END_MARK = "# END omaremote:{alias}"
+
+
+class UserError(Exception):
+    code = 2
+
+
+class UnexpectedError(Exception):
+    code = 1
+
+
+@dataclass
+class Host:
+    alias: str
+    source: str
+    line: int
+    options: dict[str, str] = field(default_factory=dict)
+    managed: bool = False
+
+    def as_json(self) -> dict[str, Any]:
+        hostname = self.options.get("hostname", "")
+        user = self.options.get("user", "")
+        port = self.options.get("port", "")
+        proxy_jump = self.options.get("proxyjump", "")
+        identity = self.options.get("identityfile", "")
+
+        target = hostname or self.alias
+        if user:
+            target = f"{user}@{target}"
+        if port and port != "22":
+            target = f"{target}:{port}"
+        details = target
+        if proxy_jump:
+            details += f"  via {proxy_jump}"
+
+        return {
+            "alias": self.alias,
+            "hostname": hostname,
+            "user": user,
+            "port": port,
+            "proxyJump": proxy_jump,
+            "identityFile": identity,
+            "details": details,
+            "source": self.source,
+            "line": self.line,
+            "managed": self.managed,
+            "searchText": " ".join(
+                value
+                for value in (
+                    self.alias,
+                    hostname,
+                    user,
+                    port,
+                    proxy_jump,
+                    identity,
+                    details,
+                )
+                if value
+            ).lower(),
+        }
+
+
+def emit(payload: dict[str, Any], code: int) -> int:
+    json.dump(payload, sys.stdout, ensure_ascii=False, separators=(",", ":"))
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+    return code
+
+
+def ok(**fields: Any) -> int:
+    payload: dict[str, Any] = {"ok": True}
+    payload.update(fields)
+    return emit(payload, 0)
+
+
+def fail(message: str, code: int = 2, **fields: Any) -> int:
+    payload: dict[str, Any] = {"ok": False, "error": message}
+    payload.update(fields)
+    return emit(payload, code)
+
+
+def home() -> Path:
+    return Path.home()
+
+
+def ssh_dir() -> Path:
+    return home() / ".ssh"
+
+
+def default_identity() -> Path:
+    return ssh_dir() / "id_ed25519"
+
+
+def default_config() -> Path:
+    return ssh_dir() / "config"
+
+
+def config_dir() -> Path:
+    return Path(os.environ.get("XDG_CONFIG_HOME", home() / ".config")) / "omaremote"
+
+
+def config_path() -> Path:
+    return config_dir() / "config.json"
+
+
+def creds_dir() -> Path:
+    return config_dir() / "credentials"
+
+
+def creds_path(name: str) -> Path:
+    return creds_dir() / name
+
+
+def systemd_user_dir() -> Path:
+    return Path(os.environ.get("XDG_CONFIG_HOME", home() / ".config")) / "systemd" / "user"
+
+
+def runtime_dir() -> Path:
+    env = os.environ.get("XDG_RUNTIME_DIR")
+    if env:
+        return Path(env)
+    return Path(f"/run/user/{os.getuid()}")
+
+
+def expand_path(value: str, base_dir: Path | None = None) -> str:
+    value = os.path.expandvars(os.path.expanduser(value))
+    if not os.path.isabs(value):
+        value = str((base_dir or home()) / value)
+    return os.path.abspath(value)
+
+
+def atomic_write(path: Path, text: str, mode: int = 0o644) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=str(path.parent), text=True)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(text)
+            if text and not text.endswith("\n"):
+                stream.write("\n")
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def run_cmd(
+    argv: list[str],
+    timeout: float = 10,
+    stdin_data: str | None = None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    if not argv:
+        raise UnexpectedError("empty command")
+    argv = [str(part) for part in argv]
+    try:
+        return subprocess.run(
+            argv,
+            input=stdin_data,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise UserError(f"command not found: {argv[0]}") from exc
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout
+        stderr = exc.stderr
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode("utf-8", "replace")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", "replace")
+        return subprocess.CompletedProcess(
+            argv,
+            124,
+            stdout or "",
+            (stderr or "") + f"timed out after {timeout}s",
+        )
+
+
+def validate_alias(alias: str) -> str:
+    alias = str(alias or "").strip()
+    if not ALIAS_RE.match(alias) or len(alias) > 64:
+        raise UserError("alias must be a single OpenSSH token (letters, digits, . _ -)")
+    if any(char in alias for char in WILDCARD_CHARS) or alias.startswith("!"):
+        raise UserError("alias must not contain wildcards")
+    return alias
+
+
+def validate_name(name: str) -> str:
+    name = str(name or "").strip()
+    if not NAME_RE.match(name) or len(name) > 64:
+        raise UserError("share name must be letters, digits, . _ -")
+    return name
+
+
+def validate_token(value: str, label: str, allow_empty: bool = False) -> str:
+    value = str(value or "").strip()
+    if value == "":
+        if allow_empty:
+            return ""
+        raise UserError(f"{label} is required")
+    if any(ch in value for ch in "\n\r\0\t ") or len(value) > 256:
+        raise UserError(f"invalid {label}")
+    return value
+
+
+def validate_path_token(value: str, label: str) -> str:
+    value = str(value or "").strip()
+    if value == "" or any(ch in value for ch in "\n\r\0") or len(value) > 512:
+        raise UserError(f"invalid {label}")
+    if "," in value:
+        raise UserError(f"{label} must not contain a comma")
+    return value
+
+
+def is_literal_alias(value: str) -> bool:
+    return bool(value) and not value.startswith("!") and not any(
+        char in value for char in WILDCARD_CHARS
+    )
+
+
+def tokens_from_line(raw_line: str) -> list[str]:
+    lexer = shlex.shlex(raw_line, posix=True)
+    lexer.whitespace_split = True
+    lexer.commenters = "#"
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        return []
+    if tokens and "=" in tokens[0]:
+        key, value = tokens[0].split("=", 1)
+        tokens = [key, value, *tokens[1:]]
+    elif len(tokens) > 1 and tokens[1] == "=":
+        tokens = [tokens[0], *tokens[2:]]
+    return tokens
+
+
+def config_lines(
+    path: Path,
+    include_base: Path,
+    stack: tuple[Path, ...] = (),
+    files: set[str] | None = None,
+    errors: list[str] | None = None,
+) -> Iterator[tuple[Path, int, str, list[str]]]:
+    files = files if files is not None else set()
+    errors = errors if errors is not None else []
+    canonical = path.expanduser().resolve(strict=False)
+    if canonical in stack:
+        errors.append(f"Skipped recursive Include: {canonical}")
+        return
+    try:
+        raw_lines = canonical.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        errors.append(f"SSH config not found: {canonical}")
+        return
+    except (OSError, UnicodeError) as exc:
+        errors.append(f"Could not read {canonical}: {exc}")
+        return
+
+    files.add(str(canonical))
+    next_stack = (*stack, canonical)
+    for line_number, raw_line in enumerate(raw_lines, start=1):
+        stripped = raw_line.strip()
+        tokens = tokens_from_line(raw_line)
+        if tokens and tokens[0].lower() == "include" and len(tokens) > 1:
+            for pattern in tokens[1:]:
+                expanded = expand_path(pattern, include_base)
+                for match in sorted(glob.glob(expanded)):
+                    match_path = Path(match)
+                    if match_path.is_file():
+                        yield from config_lines(
+                            match_path, include_base, next_stack, files, errors
+                        )
+            continue
+        yield canonical, line_number, stripped, tokens
+
+
+def discover(config: Path) -> tuple[list[Host], list[str], list[str], dict[str, bool]]:
+    hosts: list[Host] = []
+    by_alias: dict[str, Host] = {}
+    active: list[Host] = []
+    files: set[str] = set()
+    errors: list[str] = []
+    managed_aliases: dict[str, bool] = {}
+    include_base = config.expanduser().resolve(strict=False).parent
+    current_managed: str | None = None
+
+    for source, line_number, stripped, tokens in config_lines(
+        config, include_base, files=files, errors=errors
+    ):
+        begin = _marker_alias(stripped, "BEGIN")
+        end = _marker_alias(stripped, "END")
+        if begin:
+            current_managed = begin
+            managed_aliases[begin] = True
+            continue
+        if end:
+            current_managed = None
+            continue
+
+        if not tokens:
+            continue
+        key = tokens[0].lower()
+        if key == "host":
+            active = []
+            for alias in tokens[1:]:
+                if not is_literal_alias(alias):
+                    continue
+                host = by_alias.get(alias)
+                if host is None:
+                    host = Host(alias=alias, source=str(source), line=line_number)
+                    by_alias[alias] = host
+                    hosts.append(host)
+                if current_managed == alias:
+                    host.managed = True
+                active.append(host)
+            continue
+        if key == "match":
+            active = []
+            continue
+        if key in DISPLAY_KEYS and len(tokens) > 1:
+            value = " ".join(tokens[1:])
+            for host in active:
+                host.options.setdefault(key, value)
+    return hosts, sorted(files), errors, managed_aliases
+
+
+def _marker_alias(stripped: str, kind: str) -> str | None:
+    prefix = f"# {kind} omaremote:"
+    if stripped.startswith(prefix):
+        alias = stripped[len(prefix) :].strip()
+        return alias or None
+    return None
+
+
+def read_ssh_lines(config: Path) -> list[str]:
+    try:
+        return config.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return []
+    except (OSError, UnicodeError) as exc:
+        raise UserError(f"Could not read {config}: {exc}") from exc
+
+
+def find_block(lines: list[str], alias: str) -> tuple[int, int] | None:
+    begin = BEGIN_MARK.format(alias=alias)
+    end = END_MARK.format(alias=alias)
+    start = None
+    for index, line in enumerate(lines):
+        if line.strip() == begin:
+            start = index
+        elif start is not None and line.strip() == end:
+            return start, index
+    return None
+
+
+def host_exists_outside(config: Path, alias: str) -> bool:
+    hosts, _, errors, _ = discover(config)
+    for host in hosts:
+        if host.alias == alias and not host.managed:
+            return True
+    if errors and "SSH config not found" not in errors[0]:
+        pass
+    return False
+
+
+def write_ssh_config(config: Path, lines: list[str]) -> None:
+    config.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    text = "\n".join(lines)
+    if text and not text.endswith("\n"):
+        text += "\n"
+    if not text:
+        text = ""
+    mode = 0o644
+    try:
+        mode = config.stat().st_mode & 0o777
+    except FileNotFoundError:
+        pass
+    atomic_write(config, text, mode=mode)
+
+
+def host_block(alias: str, hostname: str, user: str, identity: str) -> list[str]:
+    return [
+        BEGIN_MARK.format(alias=alias),
+        f"Host {alias}",
+        f"    HostName {hostname}",
+        f"    User {user}",
+        f"    IdentityFile {identity}",
+        END_MARK.format(alias=alias),
+    ]
+
+
+def load_shares_config() -> dict[str, Any]:
+    path = config_path()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"shares": []}
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise UserError(f"Could not read {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise UserError("config.json must be an object")
+    shares = data.get("shares", [])
+    if not isinstance(shares, list):
+        raise UserError("config.json shares must be an array")
+    data["shares"] = shares
+    return data
+
+
+def save_shares_config(data: dict[str, Any]) -> None:
+    config_dir().mkdir(mode=0o700, parents=True, exist_ok=True)
+    text = json.dumps(data, indent=2, ensure_ascii=False)
+    atomic_write(config_path(), text + "\n", mode=0o600)
+
+
+def find_share(name: str, shares: list[Any] | None = None) -> dict[str, Any]:
+    name = validate_name(name)
+    if shares is None:
+        shares = load_shares_config().get("shares", [])
+    for share in shares:
+        if isinstance(share, dict) and share.get("name") == name:
+            return share
+    raise UserError(f"unknown share: {name}")
+
+
+def default_mount_point(name: str) -> str:
+    return str(home() / "mnt" / name)
+
+
+def coerce_mount_input(value: str | None, name: str) -> str:
+    if not value or not str(value).strip():
+        return default_mount_point(name)
+    raw = str(value).strip()
+    if raw.startswith("~") or raw.startswith("/"):
+        return expand_path(raw)
+    if raw == "mnt" or raw == "mnt/":
+        return str(home() / "mnt")
+    if raw.startswith("mnt/"):
+        raw = raw[4:]
+    return str(home() / "mnt" / raw)
+
+
+def mount_taken(path: str, shares: list[Any], except_name: str | None = None) -> str | None:
+    want = os.path.abspath(path)
+    for item in shares:
+        if not isinstance(item, dict):
+            continue
+        other = str(item.get("name") or "")
+        if except_name and other == except_name:
+            continue
+        mp = item.get("mountPoint")
+        if not mp:
+            continue
+        if os.path.abspath(str(mp)) == want:
+            return other
+    return None
+
+
+def validate_mount_point(value: str | None, name: str) -> str:
+    path = Path(coerce_mount_input(value, name))
+    root = (home() / "mnt").resolve()
+    try:
+        resolved = path if path.exists() else path
+        resolved = Path(os.path.abspath(str(resolved)))
+    except OSError as exc:
+        raise UserError(f"invalid mount point: {exc}") from exc
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise UserError("mount point must be under ~/mnt") from exc
+    if resolved == root:
+        raise UserError("mount point must be a subdirectory of ~/mnt")
+    return str(resolved)
+
+
+def share_source(share: dict[str, Any]) -> str:
+    kind = share.get("type")
+    if kind == "sshfs":
+        return f"{share.get('sshAlias', '')}:{share.get('remotePath', '.')}"
+    if kind == "smb":
+        user = share.get("username") or ""
+        host = share.get("host") or ""
+        name = share.get("share") or ""
+        domain = share.get("domain") or ""
+        auth = user
+        if domain and user:
+            auth = f"{domain};{user}"
+        if auth:
+            return f"smb://{auth}@{host}/{name}"
+        return f"smb://{host}/{name}"
+    return str(kind or "")
+
+
+def systemd_stem(mount_point: str) -> str:
+    result = run_cmd(["systemd-escape", "--path", mount_point], timeout=5)
+    if result.returncode != 0:
+        raise UserError(
+            f"systemd-escape failed: {(result.stderr or result.stdout).strip() or 'error'}"
+        )
+    stem = (result.stdout or "").strip()
+    if not stem:
+        raise UserError("systemd-escape returned an empty unit name")
+    return stem
+
+
+def unit_active(unit: str) -> str:
+    result = run_cmd(["systemctl", "--user", "is-active", unit], timeout=3)
+    return (result.stdout or "").strip() or "unknown"
+
+
+def findmnt_at(mount_point: str) -> str | None:
+    result = run_cmd(
+        ["findmnt", "-n", "-o", "SOURCE,FSTYPE,TARGET", "--mountpoint", mount_point],
+        timeout=3,
+    )
+    text = (result.stdout or "").strip()
+    if result.returncode != 0 or not text:
+        return None
+    return text
+
+
+def normalize_remote_path(value: str) -> str:
+    value = str(value or "").strip()
+    if value in {"", "."}:
+        return "."
+    while value.endswith("/.") and len(value) > 2:
+        value = value[:-2]
+    while len(value) > 1 and value.endswith("/"):
+        value = value[:-1]
+    return value or "."
+
+
+def remove_sshfs_units(share: dict[str, Any]) -> None:
+    mount_point = share.get("mountPoint")
+    if not mount_point:
+        return
+    try:
+        stem = systemd_stem(str(mount_point))
+    except UserError:
+        return
+    user_dir = systemd_user_dir()
+    for suffix in (".mount", ".automount"):
+        path = user_dir / f"{stem}{suffix}"
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def ensure_mount_dir(mount_point: str) -> None:
+    path = Path(mount_point)
+    if path.is_symlink() or path.is_file():
+        raise UserError(f"mount point is not a directory: {mount_point}")
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def lazy_unmount(mount_point: str) -> None:
+    for binary in ("fusermount3", "fusermount"):
+        result = run_cmd(["timeout", "5", binary, "-uz", mount_point], timeout=6)
+        if result.returncode != 127:
+            return
+
+
+def teardown_sshfs_units(share: dict[str, Any]) -> None:
+    """Drop leftover user automount units. User autofs is often not permitted."""
+    mount_point = share.get("mountPoint")
+    if mount_point:
+        try:
+            stem = systemd_stem(str(mount_point))
+        except UserError:
+            stem = ""
+        if stem:
+            auto_unit = f"{stem}.automount"
+            mount_unit = f"{stem}.mount"
+            run_cmd(["systemctl", "--user", "stop", mount_unit, auto_unit], timeout=10)
+            run_cmd(["systemctl", "--user", "disable", auto_unit], timeout=10)
+            run_cmd(["systemctl", "--user", "reset-failed", mount_unit, auto_unit], timeout=5)
+    remove_sshfs_units(share)
+    run_cmd(["systemctl", "--user", "daemon-reload"], timeout=10)
+
+
+def sshfs_fail_message(result: subprocess.CompletedProcess[str]) -> str:
+    text = f"{result.stderr or ''}\n{result.stdout or ''}".strip()
+    lower = text.lower()
+    if result.returncode == 124 or "timed out" in lower:
+        return "SSH connection timed out"
+    if looks_like_auth_failure(text):
+        return "SSH authentication failed. Copy the public key onto the server (key icon)."
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.lower().startswith("fuse: "):
+            line = line[6:].strip()
+        return line[:240]
+    return "sshfs failed"
+
+
+def mount_sshfs(share: dict[str, Any]) -> None:
+    mount_point = share["mountPoint"]
+    identity = expand_path(str(share.get("identityFile") or default_identity()))
+    if not Path(identity).is_file():
+        raise UserError(f"IdentityFile not found: {identity}")
+    if any(ch in identity for ch in ",\n\r"):
+        raise UserError("IdentityFile path is not safe")
+    alias = validate_alias(str(share.get("sshAlias") or ""))
+    remote = normalize_remote_path(str(share.get("remotePath") or "."))
+    share["remotePath"] = remote
+    source = f"{alias}:{remote}"
+    already = findmnt_at(mount_point)
+    if already and "fuse" in already.lower():
+        return
+    ensure_mount_dir(mount_point)
+    options = (
+        "reconnect,ServerAliveInterval=15,ServerAliveCountMax=3,"
+        f"ConnectTimeout=5,IdentityFile={identity},idmap=user,dir_cache=yes,"
+        "StrictHostKeyChecking=accept-new,BatchMode=yes"
+    )
+    result = run_cmd(
+        ["timeout", "8", "sshfs", source, mount_point, "-o", options],
+        timeout=10,
+    )
+    mounted = findmnt_at(mount_point)
+    if result.returncode != 0 or not mounted or "fuse" not in mounted.lower():
+        lazy_unmount(mount_point)
+        raise UserError(sshfs_fail_message(result))
+
+
+def toggle_sshfs(share: dict[str, Any], turn_on: bool) -> None:
+    mount_point = share["mountPoint"]
+    teardown_sshfs_units(share)
+    if turn_on:
+        mount_sshfs(share)
+        return
+    if findmnt_at(mount_point):
+        lazy_unmount(mount_point)
+
+
+def smb_uri(share: dict[str, Any]) -> str:
+    host = validate_token(str(share.get("host") or ""), "SMB host")
+    name = validate_token(str(share.get("share") or ""), "SMB share")
+    user = str(share.get("username") or "").strip()
+    domain = str(share.get("domain") or "").strip()
+    auth = ""
+    if user:
+        user_q = quote(user, safe="")
+        if domain:
+            auth = f"{quote(domain, safe='')};{user_q}@"
+        else:
+            auth = f"{user_q}@"
+    return f"smb://{auth}{host}/{quote(name, safe='/')}"
+
+
+def read_credentials(name: str) -> dict[str, str]:
+    path = creds_path(name)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except (OSError, UnicodeError) as exc:
+        raise UserError(f"could not read credentials: {exc}") from exc
+    creds: dict[str, str] = {}
+    if "=" not in raw:
+        password = raw.strip("\n")
+        if password:
+            creds["password"] = password
+        return creds
+    for line in raw.splitlines():
+        if not line.strip() or line.lstrip().startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip().lower()
+        if key in {"username", "password", "domain"}:
+            creds[key] = value
+    return creds
+
+
+def write_credentials(name: str, username: str, password: str, domain: str) -> None:
+    validate_name(name)
+    creds_dir().mkdir(mode=0o700, parents=True, exist_ok=True)
+    lines = []
+    if username:
+        lines.append(f"username={username}")
+    if domain:
+        lines.append(f"domain={domain}")
+    lines.append(f"password={password}")
+    atomic_write(creds_path(name), "\n".join(lines) + "\n", mode=0o600)
+
+
+def gvfs_smb_mounted(share: dict[str, Any]) -> tuple[bool, str | None]:
+    host = str(share.get("host") or "").lower()
+    name = str(share.get("share") or "").lower()
+    mount_point = str(share.get("mountPoint") or "")
+    gvfs = runtime_dir() / "gvfs"
+    if gvfs.is_dir():
+        try:
+            entries = os.listdir(gvfs)
+        except OSError:
+            entries = []
+        for entry in entries:
+            lower = entry.lower()
+            if host and host in lower and name and name in lower:
+                return True, str(gvfs / entry)
+    listed = run_cmd(["timeout", "3", "gio", "mount", "-l"], timeout=4)
+    text = (listed.stdout or "").lower()
+    if host and name and host in text and name in text and "smb://" in text:
+        return True, None
+    if mount_point and Path(mount_point).is_symlink():
+        try:
+            target = os.path.realpath(mount_point)
+        except OSError:
+            target = ""
+        if "/gvfs/" in target.replace("\\", "/"):
+            if os.path.isdir(target):
+                return True, target
+    return False, None
+
+
+def link_smb_mount(share: dict[str, Any], gvfs_path: str | None) -> None:
+    mount_point = Path(share["mountPoint"])
+    if not gvfs_path:
+        return
+    target = Path(gvfs_path)
+    if mount_point.is_symlink():
+        try:
+            if os.path.realpath(mount_point) == os.path.realpath(target):
+                return
+        except OSError:
+            pass
+        try:
+            mount_point.unlink()
+        except OSError:
+            return
+    if mount_point.exists():
+        try:
+            if mount_point.is_dir() and not os.listdir(mount_point):
+                mount_point.rmdir()
+            else:
+                return
+        except OSError:
+            return
+    try:
+        mount_point.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(target, mount_point, target_is_directory=True)
+    except OSError:
+        pass
+
+
+def unlink_smb_mount(share: dict[str, Any]) -> None:
+    mount_point = Path(share.get("mountPoint") or "")
+    if not mount_point:
+        return
+    if mount_point.is_symlink():
+        try:
+            mount_point.unlink()
+        except OSError:
+            pass
+        try:
+            mount_point.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+
+
+def toggle_smb(share: dict[str, Any], turn_on: bool) -> None:
+    uri = smb_uri(share)
+    if not turn_on:
+        run_cmd(["timeout", "8", "gio", "mount", "-u", uri], timeout=10)
+        unlink_smb_mount(share)
+        return
+
+    creds = read_credentials(str(share["name"]))
+    username = str(share.get("username") or creds.get("username") or "").strip()
+    password = creds.get("password")
+    if username and not password:
+        raise UserError(
+            "SMB credentials required: set a password with "
+            "`omaremote shares password --name "
+            f"{share['name']} --password …` or write "
+            f"{creds_path(share['name'])} (mode 0600)"
+        )
+
+    argv = ["timeout", "8", "gio", "mount"]
+    stdin_data = None
+    if not username:
+        argv.append("--anonymous")
+    argv.append(uri)
+    if password:
+        stdin_data = password if password.endswith("\n") else password + "\n"
+
+    result = run_cmd(argv, timeout=10, stdin_data=stdin_data)
+    if result.returncode != 0:
+        err = (result.stderr or result.stdout or "").strip()
+        lower = err.lower()
+        if result.returncode == 124 or "timed out" in lower:
+            raise UserError("SMB mount timed out (host down or password prompt)")
+        if any(word in lower for word in ("password", "auth", "login", "credential")):
+            raise UserError("SMB authentication failed; update credentials and retry")
+        raise UserError(err or "SMB mount failed")
+
+    mounted, gvfs_path = gvfs_smb_mounted(share)
+    if not mounted:
+        raise UserError("SMB mount did not appear under gvfs")
+    link_smb_mount(share, gvfs_path)
+
+
+def sshfs_state(share: dict[str, Any]) -> tuple[bool, str, str | None]:
+    mount_point = str(share.get("mountPoint") or "")
+    if not mount_point:
+        return False, "error", "share has no mount point"
+    mounted = findmnt_at(mount_point)
+    if mounted and "fuse" in mounted.lower():
+        return True, "mounted", None
+    return False, "off", None
+
+
+def smb_state(share: dict[str, Any]) -> tuple[bool, str, str | None]:
+    try:
+        mounted, _ = gvfs_smb_mounted(share)
+    except UserError as exc:
+        return False, "error", str(exc)
+    if mounted:
+        return True, "mounted", None
+    if share.get("enabled"):
+        return False, "error", "SMB share is enabled but not mounted"
+    return False, "off", None
+
+
+def decorate_share(share: dict[str, Any]) -> dict[str, Any]:
+    row = {
+        "name": share.get("name"),
+        "type": share.get("type"),
+        "source": share_source(share),
+        "mountPoint": share.get("mountPoint"),
+        "enabled": bool(share.get("enabled")),
+        "mounted": False,
+        "state": "off",
+        "error": None,
+        "sshAlias": share.get("sshAlias"),
+        "remotePath": share.get("remotePath"),
+        "host": share.get("host"),
+        "share": share.get("share"),
+        "username": share.get("username"),
+        "domain": share.get("domain") or "",
+        "identityFile": share.get("identityFile"),
+    }
+    kind = share.get("type")
+    try:
+        if kind == "sshfs":
+            mounted, state, error = sshfs_state(share)
+        elif kind == "smb":
+            mounted, state, error = smb_state(share)
+        else:
+            mounted, state, error = False, "error", f"unknown share type: {kind}"
+    except Exception as exc:  # noqa: BLE001 — status must never hang the CLI
+        mounted, state, error = False, "error", "status failed"
+        if isinstance(exc, UserError):
+            error = str(exc)
+    row["mounted"] = mounted
+    row["state"] = state
+    row["error"] = error
+    if kind == "sshfs":
+        row["enabled"] = mounted
+    return row
+
+
+def set_share_enabled(name: str, enabled: bool) -> dict[str, Any]:
+    data = load_shares_config()
+    share = find_share(name, data["shares"])
+    share["enabled"] = enabled
+    save_shares_config(data)
+    return share
+
+
+def resolve_identity(alias: str, identity: str | None, generate_key: bool) -> tuple[str, str, bool]:
+    generated = False
+    if generate_key:
+        key_path = ssh_dir() / f"omaremote_{alias}_ed25519"
+        if not key_path.exists():
+            ssh_dir().mkdir(mode=0o700, parents=True, exist_ok=True)
+            result = run_cmd(
+                [
+                    "ssh-keygen",
+                    "-t",
+                    "ed25519",
+                    "-N",
+                    "",
+                    "-f",
+                    str(key_path),
+                    "-C",
+                    f"omaremote-{alias}",
+                ],
+                timeout=10,
+            )
+            if result.returncode != 0:
+                raise UserError(
+                    f"ssh-keygen failed: {(result.stderr or result.stdout).strip() or 'error'}"
+                )
+            generated = True
+        identity_display = str(key_path)
+        identity_abs = str(key_path)
+    else:
+        identity_display = str(identity or "~/.ssh/id_ed25519")
+        identity_abs = expand_path(identity_display, ssh_dir())
+        if not Path(identity_abs).is_file():
+            raise UserError(f"IdentityFile not found: {identity_display}")
+    if any(ch in identity_display for ch in ("\n", "\r")):
+        raise UserError("invalid IdentityFile")
+    return identity_display, identity_abs, generated
+
+
+
+AUTH_FAIL_HINT = (
+    "SSH authentication failed. Copy the public key onto the server (key icon), "
+    "or press Enter to type a password."
+)
+
+
+def looks_like_auth_failure(text: str) -> bool:
+    lower = (text or "").lower()
+    needles = (
+        "permission denied",
+        "authentication failed",
+        "publickey",
+        "too many authentication",
+        "no more authentication methods",
+        "could not authenticate",
+        "access denied",
+        "invalid credentials",
+    )
+    return any(needle in lower for needle in needles)
+
+
+def public_key_path(host: Host | None, identity_override: str | None = None) -> Path:
+    identity = str(identity_override or "")
+    if not identity and host is not None:
+        identity = str(host.options.get("identityfile") or "")
+    if not identity:
+        identity = str(default_identity())
+    path = Path(expand_path(identity, ssh_dir()))
+    if path.suffix == ".pub":
+        return path
+    return Path(str(path) + ".pub")
+
+
+def copy_public_key(path: Path) -> None:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise UserError(f"public key not found: {path}") from exc
+    except (OSError, UnicodeError) as exc:
+        raise UserError(f"could not read public key: {exc}") from exc
+    stripped = text.strip()
+    if "PRIVATE KEY" in text:
+        raise UserError("refusing to copy a private key")
+    if not stripped.startswith(("ssh-", "ecdsa-", "sk-")):
+        raise UserError(f"not a public key: {path}")
+    try:
+        proc = subprocess.run(
+            ["wl-copy", "--trim-newline"],
+            input=stripped + "\n",
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=0.4,
+            start_new_session=True,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise UserError("command not found: wl-copy") from exc
+    except subprocess.TimeoutExpired:
+        # wl-copy can stay attached to the clipboard after the paste buffer is set.
+        return
+    if proc.returncode != 0:
+        raise UserError((proc.stderr or "wl-copy failed").strip() or "wl-copy failed")
+
+
+def command_hosts_pubkey(args: argparse.Namespace) -> int:
+    alias = validate_alias(args.alias)
+    config = Path(expand_path(args.config, ssh_dir())) if getattr(args, "config", None) else default_config()
+    hosts, _files, _errors, _ = discover(config)
+    match = next((host for host in hosts if host.alias == alias), None)
+    if match is None:
+        raise UserError(f"unknown Host alias: {alias}")
+    pub = public_key_path(match)
+    copy_public_key(pub)
+    return ok(copied=True, alias=alias, publicKeyFile=str(pub))
+
+
+def sftp_uri(host: Host) -> str:
+    """sftp URI using the SSH alias so ~/.ssh/config IdentityFile applies."""
+    alias = host.alias
+    user = str(host.options.get("user") or "")
+    port = str(host.options.get("port") or "")
+    netloc = alias
+    if user:
+        netloc = f"{quote(user, safe='')}@{netloc}"
+    if port and port != "22":
+        netloc = f"{netloc}:{port}"
+    return f"sftp://{netloc}/"
+
+
+def gvfs_local_path(uri: str) -> str | None:
+    info = run_cmd(["timeout", "3", "gio", "info", uri], timeout=4)
+    for line in (info.stdout or "").splitlines():
+        stripped = line.strip()
+        if stripped.lower().startswith("local path:"):
+            path = stripped.split(":", 1)[1].strip()
+            if path:
+                return path
+    return None
+
+
+def remote_home_local_path(host: Host, local_root: str | None) -> str | None:
+    """Prefer the remote user's home on an already-mounted gvfs sftp root."""
+    if not local_root:
+        return None
+    user = str(host.options.get("user") or "")
+    root = Path(local_root)
+    if user == "root":
+        candidates = [root / "root"]
+    elif user:
+        candidates = [root / "home" / user, root / "Users" / user]
+    else:
+        candidates = []
+    for candidate in candidates:
+        check = run_cmd(["timeout", "3", "test", "-d", str(candidate)], timeout=4)
+        if check.returncode == 0:
+            return str(candidate)
+    return None
+
+
+def sftp_home_uri(host: Host) -> str | None:
+    user = str(host.options.get("user") or "")
+    if not user:
+        return None
+    remote = "/root" if user == "root" else f"/home/{quote(user, safe='')}"
+    return sftp_uri(host).rstrip("/") + remote + "/"
+
+
+def launch_files(uri: str, local_path: str | None = None) -> None:
+    """Open with the system default file manager (xdg-open / inode/directory)."""
+    target = local_path or uri
+    argv = ["uwsm-app", "--", "xdg-open", target]
+    try:
+        subprocess.Popen(
+            argv,
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return
+    except FileNotFoundError:
+        pass
+    try:
+        subprocess.Popen(
+            ["xdg-open", target],
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError as exc:
+        raise UserError("command not found: xdg-open") from exc
+
+
+def command_hosts_files(args: argparse.Namespace) -> int:
+    alias = validate_alias(args.alias)
+    config = Path(expand_path(args.config, ssh_dir())) if getattr(args, "config", None) else default_config()
+    hosts, _files, _errors, _ = discover(config)
+    match = next((host for host in hosts if host.alias == alias), None)
+    if match is None:
+        raise UserError(f"unknown Host alias: {alias}")
+    uri = sftp_uri(match)
+    mounted = run_cmd(["timeout", "8", "gio", "mount", uri], timeout=10)
+    err = (mounted.stderr or mounted.stdout or "").strip()
+    lower = err.lower()
+    already = any(
+        phrase in lower
+        for phrase in ("already mounted", "is already mounted", "location is already")
+    )
+    if mounted.returncode == 124 or "timed out" in lower:
+        raise UserError(
+            "Timed out connecting. The host may be down, or SSH needs a key or password."
+        )
+    if mounted.returncode != 0 and not already:
+        if looks_like_auth_failure(err):
+            raise UserError(AUTH_FAIL_HINT)
+        raise UserError(err or "sftp mount failed")
+    local_root = gvfs_local_path(uri)
+    home_local = remote_home_local_path(match, local_root)
+    home_uri = sftp_home_uri(match)
+    open_local = home_local or local_root
+    open_uri = home_uri or uri
+    launch_files(open_uri, open_local)
+    return ok(opened=open_local or open_uri, uri=open_uri, alias=alias)
+
+
+def command_hosts_list(args: argparse.Namespace) -> int:
+    config = Path(expand_path(args.config, ssh_dir()))
+    hosts, files, errors, _ = discover(config)
+    rows = [host.as_json() for host in hosts]
+    rows.sort(key=lambda row: str(row["alias"]).casefold())
+    return ok(version=1, config=str(config), hosts=rows, files=files, errors=errors)
+
+
+def command_hosts_add(args: argparse.Namespace) -> int:
+    alias = validate_alias(args.alias)
+    hostname = validate_token(args.hostname, "hostname")
+    user = validate_token(args.user, "user")
+    config = Path(expand_path(args.config, ssh_dir())) if getattr(args, "config", None) else default_config()
+
+    if host_exists_outside(config, alias):
+        raise UserError(f"Host {alias} already exists in SSH config and is not managed by OmaRemote")
+
+    identity_display, identity_abs, generated = resolve_identity(
+        alias, getattr(args, "identity", None), bool(args.generate_key)
+    )
+
+    lines = read_ssh_lines(config)
+    block = host_block(alias, hostname, user, identity_display)
+    existing = find_block(lines, alias)
+    if existing:
+        start, end = existing
+        lines[start : end + 1] = block
+    else:
+        if lines and lines[-1].strip() != "":
+            lines.append("")
+        lines.extend(block)
+    write_ssh_config(config, lines)
+    pub = identity_abs + ".pub" if not identity_abs.endswith(".pub") else identity_abs
+    return ok(
+        alias=alias,
+        hostname=hostname,
+        user=user,
+        identityFile=identity_display,
+        generatedKey=generated,
+        publicKey=pub,
+        managed=True,
+    )
+
+
+
+def command_hosts_update(args: argparse.Namespace) -> int:
+    alias = validate_alias(args.alias)
+    new_alias = validate_alias(args.new_alias) if getattr(args, "new_alias", None) else alias
+    hostname = validate_token(args.hostname, "hostname")
+    user = validate_token(args.user, "user")
+    config = Path(expand_path(args.config, ssh_dir())) if getattr(args, "config", None) else default_config()
+    lines = read_ssh_lines(config)
+    existing = find_block(lines, alias)
+    if existing is None:
+        raise UserError(f"no OmaRemote-managed Host block for {alias}")
+    if new_alias != alias:
+        if find_block(lines, new_alias) is not None:
+            raise UserError(f"Host {new_alias} is already managed by OmaRemote")
+        if host_exists_outside(config, new_alias):
+            raise UserError(
+                f"Host {new_alias} already exists in SSH config and is not managed by OmaRemote"
+            )
+    identity_display, identity_abs, generated = resolve_identity(
+        new_alias, getattr(args, "identity", None), bool(args.generate_key)
+    )
+    start, end = existing
+    lines[start : end + 1] = host_block(new_alias, hostname, user, identity_display)
+    write_ssh_config(config, lines)
+    pub = identity_abs + ".pub" if not identity_abs.endswith(".pub") else identity_abs
+    return ok(
+        alias=new_alias,
+        previousAlias=alias,
+        hostname=hostname,
+        user=user,
+        identityFile=identity_display,
+        generatedKey=generated,
+        publicKey=pub,
+        managed=True,
+        updated=True,
+    )
+
+
+def command_hosts_remove(args: argparse.Namespace) -> int:
+    alias = validate_alias(args.alias)
+    config = default_config()
+    lines = read_ssh_lines(config)
+    existing = find_block(lines, alias)
+    if existing is None:
+        raise UserError(f"no OmaRemote-managed Host block for {alias}")
+    start, end = existing
+    del lines[start : end + 1]
+    while start < len(lines) and lines[start].strip() == "":
+        del lines[start]
+    if start > 0 and start <= len(lines) and lines[start - 1].strip() == "" and (
+        start == len(lines) or lines[start].strip() == ""
+    ):
+        del lines[start - 1]
+    write_ssh_config(config, lines)
+    return ok(removed=alias)
+
+
+def command_shares_list(_args: argparse.Namespace) -> int:
+    data = load_shares_config()
+    rows = []
+    for item in data.get("shares", []):
+        if isinstance(item, dict) and item.get("name"):
+            rows.append(decorate_share(item))
+    return ok(shares=rows)
+
+
+def command_shares_add(args: argparse.Namespace) -> int:
+    name = validate_name(args.name)
+    kind = str(args.type or "").strip()
+    if kind not in {"sshfs", "smb"}:
+        raise UserError("type must be sshfs or smb")
+    data = load_shares_config()
+    for item in data["shares"]:
+        if isinstance(item, dict) and item.get("name") == name:
+            raise UserError(f"share already exists: {name}")
+
+    mount_point = validate_mount_point(args.mount_point, name)
+    taken = mount_taken(mount_point, data["shares"])
+    if taken:
+        raise UserError(f"mount point already used by {taken}")
+    share: dict[str, Any] = {
+        "name": name,
+        "type": kind,
+        "mountPoint": mount_point,
+        "enabled": False,
+    }
+    if kind == "sshfs":
+        share["sshAlias"] = validate_alias(args.ssh_alias)
+        share["remotePath"] = validate_path_token(normalize_remote_path(args.remote_path or "."), "remote path")
+        identity = str(args.identity or "~/.ssh/id_ed25519")
+        validate_path_token(identity, "identity")
+        share["identityFile"] = identity
+    else:
+        share["host"] = validate_token(args.host, "host")
+        share["share"] = validate_token(args.share, "share")
+        share["username"] = validate_token(args.username or "", "username", allow_empty=True)
+        share["domain"] = validate_token(args.domain or "", "domain", allow_empty=True)
+        if args.password:
+            write_credentials(name, share["username"], args.password, share["domain"])
+
+    data["shares"].append(share)
+    save_shares_config(data)
+    row = decorate_share(share)
+    return ok(share=row)
+
+
+def command_shares_update(args: argparse.Namespace) -> int:
+    name = validate_name(args.name)
+    data = load_shares_config()
+    existing = find_share(name, data["shares"])
+    new_name = validate_name(args.new_name) if getattr(args, "new_name", None) else name
+    kind = str(args.type or existing.get("type") or "").strip()
+    if kind not in {"sshfs", "smb"}:
+        raise UserError("type must be sshfs or smb")
+    if new_name != name:
+        for item in data["shares"]:
+            if isinstance(item, dict) and item.get("name") == new_name:
+                raise UserError(f"share already exists: {new_name}")
+
+    was_enabled = bool(existing.get("enabled"))
+    old_kind = existing.get("type")
+    old_creds = creds_path(name)
+    new_creds = creds_path(new_name)
+
+    try:
+        if old_kind == "sshfs":
+            toggle_sshfs(existing, False)
+            remove_sshfs_units(existing)
+        elif old_kind == "smb":
+            toggle_smb(existing, False)
+    except UserError:
+        pass
+
+    mount_arg = getattr(args, "mount_point", None)
+    if mount_arg:
+        mount_point = validate_mount_point(mount_arg, new_name)
+    elif new_name != name:
+        mount_point = validate_mount_point(None, new_name)
+    else:
+        mount_point = validate_mount_point(existing.get("mountPoint"), new_name)
+    taken = mount_taken(mount_point, data["shares"], except_name=name)
+    if taken:
+        raise UserError(f"mount point already used by {taken}")
+
+    share: dict[str, Any] = {
+        "name": new_name,
+        "type": kind,
+        "mountPoint": mount_point,
+        "enabled": False,
+    }
+    if kind == "sshfs":
+        alias = args.ssh_alias or existing.get("sshAlias")
+        share["sshAlias"] = validate_alias(alias)
+        remote = args.remote_path if args.remote_path not in (None, "") else existing.get("remotePath", ".")
+        share["remotePath"] = validate_path_token(normalize_remote_path(remote or "."), "remote path")
+        identity = args.identity or existing.get("identityFile") or "~/.ssh/id_ed25519"
+        validate_path_token(identity, "identity")
+        share["identityFile"] = identity
+        if old_kind == "smb":
+            try:
+                old_creds.unlink()
+            except FileNotFoundError:
+                pass
+            if new_name != name:
+                try:
+                    new_creds.unlink()
+                except FileNotFoundError:
+                    pass
+    else:
+        host = args.host or existing.get("host")
+        smb_share = args.share or existing.get("share")
+        share["host"] = validate_token(host, "host")
+        share["share"] = validate_token(smb_share, "share")
+        if args.username is None:
+            share["username"] = validate_token(
+                str(existing.get("username") or "") if old_kind == "smb" else "",
+                "username",
+                allow_empty=True,
+            )
+        else:
+            share["username"] = validate_token(args.username or "", "username", allow_empty=True)
+        if args.domain is None:
+            share["domain"] = validate_token(
+                str(existing.get("domain") or "") if old_kind == "smb" else "",
+                "domain",
+                allow_empty=True,
+            )
+        else:
+            share["domain"] = validate_token(args.domain or "", "domain", allow_empty=True)
+        if args.password:
+            write_credentials(new_name, share["username"], args.password, share["domain"])
+            if new_name != name:
+                try:
+                    old_creds.unlink()
+                except FileNotFoundError:
+                    pass
+        elif new_name != name and old_creds.is_file():
+            new_creds.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            old_creds.replace(new_creds)
+
+    data["shares"] = [
+        share if isinstance(item, dict) and item.get("name") == name else item
+        for item in data["shares"]
+    ]
+    save_shares_config(data)
+
+    if was_enabled:
+        try:
+            if kind == "sshfs":
+                toggle_sshfs(share, True)
+            else:
+                toggle_smb(share, True)
+            share["enabled"] = True
+            save_shares_config(data)
+        except UserError:
+            share["enabled"] = False
+            save_shares_config(data)
+
+    return ok(share=decorate_share(share), updated=True, previousName=name)
+
+
+def command_shares_remove(args: argparse.Namespace) -> int:
+    name = validate_name(args.name)
+    data = load_shares_config()
+    share = find_share(name, data["shares"])
+    try:
+        if share.get("type") == "sshfs":
+            toggle_sshfs(share, False)
+            remove_sshfs_units(share)
+        elif share.get("type") == "smb":
+            toggle_smb(share, False)
+    except UserError:
+        pass
+    data["shares"] = [item for item in data["shares"] if item.get("name") != name]
+    save_shares_config(data)
+    try:
+        creds_path(name).unlink()
+    except FileNotFoundError:
+        pass
+    return ok(removed=name)
+
+
+def command_shares_toggle(args: argparse.Namespace) -> int:
+    name = validate_name(args.name)
+    state = str(args.state or "").strip().lower()
+    if state not in {"on", "off"}:
+        raise UserError("state must be on or off")
+    turn_on = state == "on"
+    data = load_shares_config()
+    share = find_share(name, data["shares"])
+    kind = share.get("type")
+    if kind == "sshfs":
+        toggle_sshfs(share, turn_on)
+    elif kind == "smb":
+        toggle_smb(share, turn_on)
+    else:
+        raise UserError(f"unknown share type: {kind}")
+    share["enabled"] = turn_on
+    save_shares_config(data)
+    return ok(share=decorate_share(share))
+
+
+def command_shares_open(args: argparse.Namespace) -> int:
+    share = find_share(args.name)
+    mount_point = str(share.get("mountPoint") or "")
+    if not mount_point:
+        raise UserError("share has no mount point")
+    if share.get("type") == "sshfs" and not share.get("enabled"):
+        raise UserError("enable the share before opening it")
+    if share.get("type") == "smb" and not share.get("enabled"):
+        raise UserError("enable the share before opening it")
+    # Probe the mount with a timeout. Do not wait on xdg-open: the file
+    # manager staying open looks like a hang, and timeout then kills it.
+    probe = run_cmd(["timeout", "8", "test", "-d", mount_point], timeout=10)
+    if probe.returncode == 124:
+        raise UserError(
+            "Opening timed out. The host may be down, or SSH needs a key or password."
+        )
+    if probe.returncode != 0:
+        raise UserError("mount point is not available. Enable the share first.")
+    launch_files(mount_point)
+    return ok(opened=mount_point)
+
+
+def command_shares_password(args: argparse.Namespace) -> int:
+    name = validate_name(args.name)
+    data = load_shares_config()
+    share = find_share(name, data["shares"])
+    if share.get("type") != "smb":
+        raise UserError("passwords are only used for SMB shares")
+    if not args.password:
+        raise UserError("password is required")
+    write_credentials(
+        name,
+        str(share.get("username") or ""),
+        args.password,
+        str(share.get("domain") or ""),
+    )
+    return ok(name=name, credentials=True)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="group", required=True)
+
+    hosts = sub.add_parser("hosts", help="SSH host aliases")
+    hosts_sub = hosts.add_subparsers(dest="command", required=True)
+
+    hosts_list = hosts_sub.add_parser("list", help="list literal Host aliases as JSON")
+    hosts_list.add_argument("--config", default="~/.ssh/config")
+    hosts_list.set_defaults(handler=command_hosts_list)
+
+    hosts_add = hosts_sub.add_parser("add", help="append a marked Host block")
+    hosts_add.add_argument("--alias", required=True)
+    hosts_add.add_argument("--hostname", required=True)
+    hosts_add.add_argument("--user", required=True)
+    hosts_add.add_argument("--identity", default="~/.ssh/id_ed25519")
+    hosts_add.add_argument("--generate-key", action="store_true")
+    hosts_add.add_argument("--config", default="~/.ssh/config")
+    hosts_add.set_defaults(handler=command_hosts_add)
+
+    hosts_update = hosts_sub.add_parser("update", help="rewrite a marked OmaRemote Host block")
+    hosts_update.add_argument("--alias", required=True)
+    hosts_update.add_argument("--new-alias")
+    hosts_update.add_argument("--hostname", required=True)
+    hosts_update.add_argument("--user", required=True)
+    hosts_update.add_argument("--identity", default="~/.ssh/id_ed25519")
+    hosts_update.add_argument("--generate-key", action="store_true")
+    hosts_update.add_argument("--config", default="~/.ssh/config")
+    hosts_update.set_defaults(handler=command_hosts_update)
+
+    hosts_remove = hosts_sub.add_parser("remove", help="remove a marked OmaRemote Host block")
+    hosts_remove.add_argument("--alias", required=True)
+    hosts_remove.set_defaults(handler=command_hosts_remove)
+
+    hosts_files = hosts_sub.add_parser("files", help="open a Host in the file manager over sftp")
+    hosts_files.add_argument("--alias", required=True)
+    hosts_files.add_argument("--config", default="~/.ssh/config")
+    hosts_files.set_defaults(handler=command_hosts_files)
+
+    hosts_pubkey = hosts_sub.add_parser("pubkey", help="copy this Host public key to the clipboard")
+    hosts_pubkey.add_argument("--alias", required=True)
+    hosts_pubkey.add_argument("--config", default="~/.ssh/config")
+    hosts_pubkey.set_defaults(handler=command_hosts_pubkey)
+
+    shares = sub.add_parser("shares", help="remote filesystem shares")
+    shares_sub = shares.add_subparsers(dest="command", required=True)
+
+    shares_list = shares_sub.add_parser("list", help="list shares and mount state")
+    shares_list.set_defaults(handler=command_shares_list)
+
+    shares_status = shares_sub.add_parser("status", help="alias of list")
+    shares_status.set_defaults(handler=command_shares_list)
+
+    shares_add = shares_sub.add_parser("add", help="add a share definition")
+    shares_add.add_argument("--name", required=True)
+    shares_add.add_argument("--type", required=True, choices=["sshfs", "smb"])
+    shares_add.add_argument("--ssh-alias")
+    shares_add.add_argument("--remote-path", default=".")
+    shares_add.add_argument("--identity", default="~/.ssh/id_ed25519")
+    shares_add.add_argument("--host")
+    shares_add.add_argument("--share")
+    shares_add.add_argument("--username", default="")
+    shares_add.add_argument("--domain", default="")
+    shares_add.add_argument("--password", default="")
+    shares_add.add_argument("--mount-point")
+    shares_add.set_defaults(handler=command_shares_add)
+
+    shares_update = shares_sub.add_parser("update", help="update a share definition")
+    shares_update.add_argument("--name", required=True)
+    shares_update.add_argument("--new-name")
+    shares_update.add_argument("--type", required=True, choices=["sshfs", "smb"])
+    shares_update.add_argument("--ssh-alias")
+    shares_update.add_argument("--remote-path")
+    shares_update.add_argument("--identity")
+    shares_update.add_argument("--host")
+    shares_update.add_argument("--share")
+    shares_update.add_argument("--username")
+    shares_update.add_argument("--domain")
+    shares_update.add_argument("--password", default="")
+    shares_update.add_argument("--mount-point")
+    shares_update.set_defaults(handler=command_shares_update)
+
+    shares_remove = shares_sub.add_parser("remove", help="remove a share")
+    shares_remove.add_argument("--name", required=True)
+    shares_remove.set_defaults(handler=command_shares_remove)
+
+    shares_toggle = shares_sub.add_parser("toggle", help="enable or disable a share")
+    shares_toggle.add_argument("--name", required=True)
+    shares_toggle.add_argument("state", choices=["on", "off"])
+    shares_toggle.set_defaults(handler=command_shares_toggle)
+
+    shares_open = shares_sub.add_parser("open", help="open a share mount point with a timeout")
+    shares_open.add_argument("--name", required=True)
+    shares_open.set_defaults(handler=command_shares_open)
+
+    shares_password = shares_sub.add_parser("password", help="store SMB credentials")
+    shares_password.add_argument("--name", required=True)
+    shares_password.add_argument("--password", required=True)
+    shares_password.set_defaults(handler=command_shares_password)
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    try:
+        args = parser.parse_args()
+        return int(args.handler(args))
+    except UserError as exc:
+        return fail(str(exc), getattr(exc, "code", 2))
+    except BrokenPipeError:
+        return 0
+    except Exception as exc:  # noqa: BLE001
+        return fail(f"unexpected error: {type(exc).__name__}", 1)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

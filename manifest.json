@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "omaremote",
+  "name": "OmaRemote",
+  "version": "0.1.20",
+  "author": "Tony Rumans",
+  "license": "MIT",
+  "description": "Toggle remote shares (sshfs + SMB) and manage SSH hosts.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "OmaRemote",
+    "description": "Toggle remote shares (sshfs + SMB) and manage SSH hosts.",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
