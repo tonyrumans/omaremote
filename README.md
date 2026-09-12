@@ -42,6 +42,15 @@ Right-click the icon to refresh. The widget defaults to the right section.
 omarchy bar move omaremote --section right
 ```
 
+## How to use
+
+1. Left-click the bar icon (Hosts opens with search focused).
+2. Type to filter, ↑↓ to move, **Enter** to SSH in a terminal.
+3. **Ctrl+Enter** opens the host in your file manager over sftp; **Ctrl+K** copies the public key; **Shift+Enter** edits a managed alias.
+4. Switch to **Shares** to add sshfs/SMB mounts under `~/mnt`, toggle them on/off, and open mounted folders.
+5. Right-click the bar icon to refresh.
+
+
 ## Shares
 
 Share definitions live in `~/.config/omaremote/config.json` (created on first use). Mount points default to `~/mnt/<name>` and must stay under `~/mnt`.

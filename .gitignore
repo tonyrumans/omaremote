@@ -16,3 +16,4 @@ id_*
 .env
 *.env
 mnt/
+MARKETPLACE.md
