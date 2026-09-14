@@ -161,7 +161,8 @@ Panel {
   }
 
   function helperCommand(args) {
-    return ["python3", helperPath()].concat(args)
+    // Absolute interpreter — do not rely on PATH for python3.
+    return ["/usr/bin/python3", helperPath()].concat(args)
   }
 
   function beginConnecting(name, kind) {
@@ -655,6 +656,8 @@ Panel {
 
   Process {
     id: helperProcess
+    // StdioCollector has no max-size property in Quickshell; the Python helper
+    // caps subprocess capture and JSON emit to 64KiB instead.
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.applyResult(text)

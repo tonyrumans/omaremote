@@ -7,6 +7,7 @@ import argparse
 import glob
 import json
 import os
+import pwd
 import re
 import shlex
 import subprocess
@@ -24,6 +25,14 @@ ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 BEGIN_MARK = "# BEGIN omaremote:{alias}"
 END_MARK = "# END omaremote:{alias}"
+
+# Security: resolve helpers only under a fixed trusted PATH; never bare shutil.which.
+TRUSTED_PATH = "/usr/bin:/bin"
+TRUSTED_BIN_DIRS = ("/usr/bin", "/bin")
+TRUSTED_SBIN_DIRS = ("/usr/sbin", "/sbin")
+SBIN_TOOLS = frozenset({"fusermount3", "fusermount", "systemctl", "systemd-escape"})
+OUTPUT_CAP = 65536
+TRUNCATE_MARKER = "\n...[truncated]...\n"
 
 
 class UserError(Exception):
@@ -86,8 +95,21 @@ class Host:
 
 
 def emit(payload: dict[str, Any], code: int) -> int:
-    json.dump(payload, sys.stdout, ensure_ascii=False, separators=(",", ":"))
-    sys.stdout.write("\n")
+    # Bound helper stdout so QML StdioCollector cannot be flooded (no max-size API there).
+    text = json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+    raw = text.encode("utf-8")
+    if len(raw) > OUTPUT_CAP:
+        text = (
+            json.dumps(
+                {"ok": False, "error": "response exceeded output cap"},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
+        if code == 0:
+            code = 1
+    sys.stdout.write(text)
     sys.stdout.flush()
     return code
 
@@ -105,7 +127,31 @@ def fail(message: str, code: int = 2, **fields: Any) -> int:
 
 
 def home() -> Path:
-    return Path.home()
+    """Passwd home for the real UID — not HOME from the inherited environment."""
+    return Path(pwd.getpwuid(os.getuid()).pw_dir)
+
+
+def _is_under(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def xdg_config_home() -> Path:
+    """Config root: ~/.config, or XDG_CONFIG_HOME only if it resolves under $HOME."""
+    raw = os.environ.get("XDG_CONFIG_HOME")
+    if not raw:
+        return home() / ".config"
+    candidate = Path(os.path.expanduser(raw))
+    try:
+        resolved = candidate.resolve()
+    except OSError as exc:
+        raise UserError(f"invalid XDG_CONFIG_HOME: {exc}") from exc
+    if not _is_under(resolved, home()):
+        raise UserError("XDG_CONFIG_HOME must resolve under the user home directory")
+    return resolved
 
 
 def ssh_dir() -> Path:
@@ -121,7 +167,7 @@ def default_config() -> Path:
 
 
 def config_dir() -> Path:
-    return Path(os.environ.get("XDG_CONFIG_HOME", home() / ".config")) / "omaremote"
+    return xdg_config_home() / "omaremote"
 
 
 def config_path() -> Path:
@@ -137,18 +183,89 @@ def creds_path(name: str) -> Path:
 
 
 def systemd_user_dir() -> Path:
-    return Path(os.environ.get("XDG_CONFIG_HOME", home() / ".config")) / "systemd" / "user"
+    return xdg_config_home() / "systemd" / "user"
 
 
 def runtime_dir() -> Path:
+    uid = os.getuid()
+    fallback = Path(f"/run/user/{uid}")
     env = os.environ.get("XDG_RUNTIME_DIR")
-    if env:
-        return Path(env)
-    return Path(f"/run/user/{os.getuid()}")
+    if not env:
+        return fallback
+    try:
+        resolved = Path(env).resolve()
+    except OSError:
+        return fallback
+    # Accept only the standard per-user runtime root (or a subdir of it).
+    if resolved == fallback or _is_under(resolved, fallback):
+        return resolved
+    return fallback
+
+
+def resolve_bin(name: str) -> str:
+    """Resolve a bare command name under trusted dirs only (never full PATH / shutil.which)."""
+    name = str(name or "").strip()
+    if not name:
+        raise UserError("empty command")
+    if os.path.isabs(name):
+        if os.path.isfile(name) and os.access(name, os.X_OK):
+            return name
+        raise UserError(f"command not found: {name}")
+    if "/" in name or name in {".", ".."}:
+        raise UserError(f"command not found: {name}")
+    dirs = list(TRUSTED_BIN_DIRS)
+    if name in SBIN_TOOLS:
+        dirs.extend(TRUSTED_SBIN_DIRS)
+    for directory in dirs:
+        candidate = os.path.join(directory, name)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    raise UserError(f"command not found: {name}")
+
+
+def trusted_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """Minimal environment for helper subprocesses."""
+    pw = pwd.getpwuid(os.getuid())
+    env: dict[str, str] = {
+        "PATH": TRUSTED_PATH,
+        "HOME": pw.pw_dir,
+        "USER": pw.pw_name,
+        "LOGNAME": pw.pw_name,
+        "XDG_CONFIG_HOME": str(xdg_config_home()),
+    }
+    for key in ("LANG", "LC_ALL", "LC_CTYPE"):
+        value = os.environ.get(key)
+        if value:
+            env[key] = value
+    runtime = runtime_dir()
+    env["XDG_RUNTIME_DIR"] = str(runtime)
+    if extra:
+        # Intentional extras only — never reintroduce a full inherited environ.
+        for key, value in extra.items():
+            if value is not None:
+                env[str(key)] = str(value)
+    return env
+
+
+def truncate_output(data: str | bytes | None, limit: int = OUTPUT_CAP) -> str:
+    if data is None:
+        return ""
+    if isinstance(data, bytes):
+        raw = data
+    else:
+        raw = data.encode("utf-8", "replace")
+    if len(raw) <= limit:
+        return raw.decode("utf-8", "replace") if isinstance(data, bytes) else data
+    marker = TRUNCATE_MARKER.encode("ascii")
+    keep = max(0, limit - len(marker))
+    return raw[:keep].decode("utf-8", "replace") + TRUNCATE_MARKER
 
 
 def expand_path(value: str, base_dir: Path | None = None) -> str:
-    value = os.path.expandvars(os.path.expanduser(value))
+    # Expand ~ from passwd home, not a forged HOME.
+    if value.startswith("~"):
+        value = str(home()) + value[1:]
+    # Do not expand arbitrary $VARS from a hostile environment.
     if not os.path.isabs(value):
         value = str((base_dir or home()) / value)
     return os.path.abspath(value)
@@ -176,13 +293,21 @@ def run_cmd(
     argv: list[str],
     timeout: float = 10,
     stdin_data: str | None = None,
-    env: dict[str, str] | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     if not argv:
         raise UnexpectedError("empty command")
     argv = [str(part) for part in argv]
+    if not os.path.isabs(argv[0]):
+        argv[0] = resolve_bin(argv[0])
+    # Our only timeout(1) form is: timeout DURATION CMD [args...] — resolve CMD too.
+    if os.path.basename(argv[0]) == "timeout" and len(argv) >= 3:
+        cmd_idx = 2
+        if not os.path.isabs(argv[cmd_idx]) and not str(argv[cmd_idx]).startswith("-"):
+            argv[cmd_idx] = resolve_bin(argv[cmd_idx])
+    env = trusted_env(extra_env)
     try:
-        return subprocess.run(
+        completed = subprocess.run(
             argv,
             input=stdin_data,
             capture_output=True,
@@ -191,20 +316,22 @@ def run_cmd(
             env=env,
             check=False,
         )
+        return subprocess.CompletedProcess(
+            completed.args,
+            completed.returncode,
+            truncate_output(completed.stdout),
+            truncate_output(completed.stderr),
+        )
     except FileNotFoundError as exc:
         raise UserError(f"command not found: {argv[0]}") from exc
     except subprocess.TimeoutExpired as exc:
-        stdout = exc.stdout
-        stderr = exc.stderr
-        if isinstance(stdout, bytes):
-            stdout = stdout.decode("utf-8", "replace")
-        if isinstance(stderr, bytes):
-            stderr = stderr.decode("utf-8", "replace")
+        stdout = truncate_output(exc.stdout)
+        stderr = truncate_output(exc.stderr)
         return subprocess.CompletedProcess(
             argv,
             124,
-            stdout or "",
-            (stderr or "") + f"timed out after {timeout}s",
+            stdout,
+            stderr + f"timed out after {timeout}s",
         )
 
 
@@ -275,7 +402,7 @@ def config_lines(
 ) -> Iterator[tuple[Path, int, str, list[str]]]:
     files = files if files is not None else set()
     errors = errors if errors is not None else []
-    canonical = path.expanduser().resolve(strict=False)
+    canonical = Path(expand_path(str(path))).resolve(strict=False)
     if canonical in stack:
         errors.append(f"Skipped recursive Include: {canonical}")
         return
@@ -313,7 +440,7 @@ def discover(config: Path) -> tuple[list[Host], list[str], list[str], dict[str, 
     files: set[str] = set()
     errors: list[str] = []
     managed_aliases: dict[str, bool] = {}
-    include_base = config.expanduser().resolve(strict=False).parent
+    include_base = Path(expand_path(str(config))).resolve(strict=False).parent
     current_managed: str | None = None
 
     for source, line_number, stripped, tokens in config_lines(
@@ -586,7 +713,11 @@ def ensure_mount_dir(mount_point: str) -> None:
 
 
 def lazy_unmount(mount_point: str) -> None:
-    for binary in ("fusermount3", "fusermount"):
+    for name in ("fusermount3", "fusermount"):
+        try:
+            binary = resolve_bin(name)
+        except UserError:
+            continue
         result = run_cmd(["timeout", "5", binary, "-uz", mount_point], timeout=6)
         if result.returncode != 127:
             return
@@ -985,15 +1116,17 @@ def copy_public_key(path: Path) -> None:
         raise UserError("refusing to copy a private key")
     if not stripped.startswith(("ssh-", "ecdsa-", "sk-")):
         raise UserError(f"not a public key: {path}")
+    wl_copy = resolve_bin("wl-copy")
     try:
         proc = subprocess.run(
-            ["wl-copy", "--trim-newline"],
+            [wl_copy, "--trim-newline"],
             input=stripped + "\n",
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
             timeout=0.4,
             start_new_session=True,
+            env=trusted_env(),
             check=False,
         )
     except FileNotFoundError as exc:
@@ -1002,7 +1135,8 @@ def copy_public_key(path: Path) -> None:
         # wl-copy can stay attached to the clipboard after the paste buffer is set.
         return
     if proc.returncode != 0:
-        raise UserError((proc.stderr or "wl-copy failed").strip() or "wl-copy failed")
+        err = truncate_output(proc.stderr).strip() or "wl-copy failed"
+        raise UserError(err)
 
 
 def command_hosts_pubkey(args: argparse.Namespace) -> int:
@@ -1071,25 +1205,33 @@ def sftp_home_uri(host: Host) -> str | None:
 def launch_files(uri: str, local_path: str | None = None) -> None:
     """Open with the system default file manager (xdg-open / inode/directory)."""
     target = local_path or uri
-    argv = ["uwsm-app", "--", "xdg-open", target]
+    env = trusted_env()
+    xdg_open = resolve_bin("xdg-open")
+    try:
+        uwsm = resolve_bin("uwsm-app")
+    except UserError:
+        uwsm = None
+    if uwsm is not None:
+        try:
+            subprocess.Popen(
+                [uwsm, "--", xdg_open, target],
+                start_new_session=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=env,
+            )
+            return
+        except FileNotFoundError:
+            pass
     try:
         subprocess.Popen(
-            argv,
+            [xdg_open, target],
             start_new_session=True,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-        )
-        return
-    except FileNotFoundError:
-        pass
-    try:
-        subprocess.Popen(
-            ["xdg-open", target],
-            start_new_session=True,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            env=env,
         )
     except FileNotFoundError as exc:
         raise UserError("command not found: xdg-open") from exc

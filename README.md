@@ -94,6 +94,8 @@ omarchy-launch-terminal ssh -- <alias>
 
 `bin/omaremote` is Python 3, standard library only. It always prints one JSON object on stdout. Exit `0` on success, `2` on user/config errors, `1` on unexpected failures. User values are passed as argument arrays, never interpolated into a shell string.
 
+External tools (`sshfs`, `gio`, `systemctl`, `ssh-keygen`, `xdg-open`, etc.) are resolved only under `/usr/bin` and `/bin` (plus `/usr/sbin`/`/sbin` for fuse/systemd helpers), via a fixed `PATH=/usr/bin:/bin`. Subprocesses get a minimal trusted environment (`HOME`/`USER` from the passwd database, validated `XDG_CONFIG_HOME` / `XDG_RUNTIME_DIR`). Captured stdout/stderr and helper JSON output are capped at 64KiB. The panel launches the helper with `/usr/bin/python3`.
+
 ```
 omaremote hosts list
 omaremote hosts add --alias NAME --hostname HOST --user USER [--identity PATH] [--generate-key]
